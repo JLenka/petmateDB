@@ -557,8 +557,13 @@ function makeDemoApi() {
     async init() { return null; },
     onAuth(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     async session() { return signedIn ? { user: { id: db.owner.id, email: db.owner.email } } : null; },
-    async sendLink(email) { db.owner.email = email || db.owner.email; return { ok: true }; },
-    async verifyCode() { signedIn = true; listeners.forEach(f => f()); return { ok: true }; },
+    async signIn(email) { db.owner.email = email || db.owner.email; signedIn = true; listeners.forEach(f => f('SIGNED_IN')); },
+    async signUp(email) { db.owner.email = email; return { needsConfirm: false }; },
+    async verifySignup() { signedIn = true; listeners.forEach(f => f('SIGNED_IN')); },
+    async resendSignup() {},
+    async sendReset() {},
+    async verifyReset() { signedIn = true; listeners.forEach(f => f('PASSWORD_RECOVERY')); },
+    async setPassword() {},
     async demoSignIn() { signedIn = true; listeners.forEach(f => f()); },
     async signOut() { signedIn = false; db = demoSeed(); listeners.forEach(f => f()); },
     async profile() { return clone(db.owner); },
@@ -668,13 +673,25 @@ function makeLiveApi() {
   const api = {
     mode: 'live', sb,
     async init() { const { data } = await sb.auth.getSession(); userId = data.session?.user?.id || null; return data.session; },
-    onAuth(fn) { const { data } = sb.auth.onAuthStateChange((_e, s) => { userId = s?.user?.id || null; fn(s); }); return () => data.subscription.unsubscribe(); },
+    // Supabase warns against awaiting other Supabase calls inside this callback (auth lock), so hand off with setTimeout.
+    onAuth(fn) { const { data } = sb.auth.onAuthStateChange((evt, s) => { userId = s?.user?.id || null; setTimeout(() => fn(evt, s), 0); }); return () => data.subscription.unsubscribe(); },
     async session() { const { data } = await sb.auth.getSession(); userId = data.session?.user?.id || null; return data.session; },
-    async sendLink(email) {
-      must(await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname, shouldCreateUser: true } }));
-      return { ok: true };
+    async signIn(email, password) { must(await sb.auth.signInWithPassword({ email, password })); },
+    async signUp(email, password) {
+      const d = must(await sb.auth.signUp({ email, password, options: { emailRedirectTo: location.origin + location.pathname } }));
+      // An existing, confirmed email comes back with no identities and no session (Supabase hides that it exists).
+      if (d.user && Array.isArray(d.user.identities) && d.user.identities.length === 0) return { exists: true };
+      return { needsConfirm: !d.session };
     },
-    async verifyCode(email, token) { must(await sb.auth.verifyOtp({ email, token, type: 'email' })); return { ok: true }; },
+    async verifySignup(email, token) {
+      const a = await sb.auth.verifyOtp({ email, token, type: 'signup' });
+      if (!a.error) return;
+      must(await sb.auth.verifyOtp({ email, token, type: 'email' }));
+    },
+    async resendSignup(email) { must(await sb.auth.resend({ type: 'signup', email, options: { emailRedirectTo: location.origin + location.pathname } })); },
+    async sendReset(email) { must(await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname })); },
+    async verifyReset(email, token) { must(await sb.auth.verifyOtp({ email, token, type: 'recovery' })); },
+    async setPassword(password) { must(await sb.auth.updateUser({ password })); },
     async signOut() { await sb.auth.signOut(); },
     async profile() { return must(await sb.from('profiles').select('*').eq('id', userId).single()); },
     async updateProfile(p) { must(await sb.from('profiles').update(p).eq('id', userId)); },
@@ -758,9 +775,15 @@ function makeLiveApi() {
 function friendly(e) {
   const m = e?.message || String(e);
   const wait = m.match(/after (\d+) seconds?/i);
-  if (wait) return new Error(`Please wait ${wait[1]} seconds before requesting another sign-in email.`);
-  if (/email rate limit|over_email_send_rate_limit/i.test(m) || e?.code === 'over_email_send_rate_limit') return new Error('The hourly limit for sign-in emails has been reached. Try again in up to an hour, or use the code from an email you already received.');
+  if (wait) return new Error(`Please wait ${wait[1]} seconds before requesting another email.`);
+  if (/email rate limit|over_email_send_rate_limit/i.test(m) || e?.code === 'over_email_send_rate_limit') return new Error('The hourly limit for PetMate emails has been reached. Try again in up to an hour, or use the code from an email you already received.');
   if (/rate limit|too many/i.test(m)) return new Error('Too many attempts just now. Wait a few minutes and try again.');
+  if (/invalid login credentials|invalid_credentials/i.test(m + (e?.code || ''))) return new Error('Email or password is wrong. Check both, or use "Forgot password".');
+  if (/email not confirmed|email_not_confirmed/i.test(m + (e?.code || ''))) { const x = new Error('Confirm your email first. Enter the code from the PetMate confirmation email.'); x.code = 'email_not_confirmed'; return x; }
+  if (/already registered|user_already_exists/i.test(m + (e?.code || ''))) return new Error('An account with this email already exists. Sign in instead.');
+  if (/signups? not allowed|signup_disabled/i.test(m + (e?.code || ''))) return new Error('New sign-ups are switched off. Ask PetMate to create your account.');
+  if (/weak_password|password should|password is known/i.test(m + (e?.code || ''))) return new Error('Choose a stronger password: at least 8 characters, mixing letters and numbers, and not a common one.');
+  if (/same_password|different from the old/i.test(m + (e?.code || ''))) return new Error('The new password must be different from your old one.');
   if (/otp_expired|token has expired|invalid/i.test(m) && /otp|token|code/i.test(m + (e?.code || ''))) return new Error('That code is wrong, expired, or was replaced by a newer email. Use the code from the most recent PetMate email.');
   if (/microchip/i.test(m) || /pets_microchip_unique/.test(m)) return new Error('That microchip number is already registered to another pet.');
   if (/violates check constraint/i.test(m)) return new Error('One of the values is out of range. Check dates, weight and phone number.');
@@ -829,7 +852,7 @@ const { html, render, useState, useEffect, useRef, useMemo } = htmPreact;
 const Icon = ({ n, fill, cls = '', style }) => html`<span class=${`ms ${fill ? 'fill' : ''} ${cls}`} aria-hidden="true" style=${style}>${n}</span>`;
 
 const SCREENS = [
-  ['welcome', 'Welcome', 'waving_hand', 'Start'], ['signin', 'Sign in', 'login', 'Start'], ['ob', 'Create pet profile', 'pets', 'Start'],
+  ['welcome', 'Welcome', 'waving_hand', 'Start'], ['signin', 'Sign in', 'login', 'Start'], ['signup', 'Create account', 'person_add', 'Start'], ['ob', 'Create pet profile', 'pets', 'Start'],
   ['home', 'Home · today', 'home', 'App'], ['profile', 'Pet profile & records', 'badge', 'App'],
   ['routine', 'Routine Builder', 'checklist', 'Care tools'], ['handoff', 'Care Handoff', 'ios_share', 'Care tools'], ['meds', 'Medications', 'medication', 'Care tools'],
   ['ask', 'Ask the record', 'forum', 'Care tools'], ['scan', 'Document Scanner', 'document_scanner', 'Care tools'], ['emergency', 'Emergency help', 'emergency', 'Care tools'],
@@ -888,59 +911,120 @@ function Welcome({ ctx }) {
       <p class="lede">Routines, vaccines and history in one place. Share the right part with sitters, kennels and vets in seconds.</p>
     </div>
     <div class="stack">
-      <button class="btn" id="wel-start" onClick=${() => ctx.api.mode === 'demo' ? ctx.go('ob') : ctx.go('signin')}>Get started</button>
+      <button class="btn" id="wel-start" onClick=${() => ctx.api.mode === 'demo' ? ctx.go('ob') : ctx.go('signup')}>Get started</button>
       <button class="btn ghost" id="wel-signin" onClick=${() => ctx.go('signin')}>I already have an account</button>
     </div>
   </div>`;
 }
 
-function SignIn({ ctx }) {
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+function PasswordInput({ id, value, onInput, autocomplete, cls = '', placeholder }) {
+  const [show, setShow] = useState(false);
+  return html`<div style="position:relative">
+    <input id=${id} class=${`input ${cls}`} style="padding-right:52px" type=${show ? 'text' : 'password'} autocomplete=${autocomplete} value=${value} placeholder=${placeholder} onInput=${e => onInput(e.target.value)} />
+    <button type="button" class="iconbtn" style="position:absolute;right:4px;top:4px;width:42px;height:42px;box-shadow:none;background:transparent" aria-label=${show ? 'Hide password' : 'Show password'} onClick=${() => setShow(!show)}><${Icon} n=${show ? 'visibility_off' : 'visibility'} /></button>
+  </div>`;
+}
+const pwProblem = pw => pw.length < 8 ? 'Use at least 8 characters' : !/[A-Za-z]/.test(pw) || !/\d/.test(pw) ? 'Mix letters and numbers' : '';
+
+/* Email + password sign-in. Emails are only sent to confirm a new account and for "Forgot password". */
+function Auth({ ctx, start }) {
+  const [mode, setMode] = useState(start || 'signin'); // signin | signup | confirm | forgot | resetcode
   const [email, setEmail] = useState('');
+  const [pw, setPw] = useState('');
+  const [pw2, setPw2] = useState('');
   const [code, setCode] = useState('');
-  const [stage, setStage] = useState('email');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [info, setInfo] = useState('');
   const [wait, setWait] = useState(0);
   useEffect(() => { if (wait <= 0) return; const t = setTimeout(() => setWait(wait - 1), 1000); return () => clearTimeout(t); }, [wait]);
-  const valid = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim());
-  const send = async () => {
-    if (!valid) { setErr('Enter a valid email address, like name@gmail.com'); return; }
-    setBusy(true); setErr('');
-    try { await ctx.api.sendLink(email.trim()); setStage('sent'); setWait(60); }
-    catch (e) { setErr(e.message); } finally { setBusy(false); }
+  const go = m => { setMode(m); setErr(''); setInfo(''); setCode(''); };
+  const run = async fn => { setBusy(true); setErr(''); try { await fn(); } catch (e) { setErr(e.message); if (e.code === 'email_not_confirmed') go('confirm'); } finally { setBusy(false); } };
+  const needEmail = () => { if (!EMAIL_RE.test(email.trim())) { setErr('Enter a valid email address, like name@gmail.com'); return false; } return true; };
+
+  const signIn = () => { if (!needEmail()) return; if (!pw) { setErr('Enter your password'); return; } run(() => ctx.api.signIn(email.trim(), pw)); };
+  const signUp = () => {
+    if (!needEmail()) return;
+    const p = pwProblem(pw); if (p) { setErr(p); return; }
+    if (pw !== pw2) { setErr("The two passwords don't match"); return; }
+    run(async () => {
+      const r = await ctx.api.signUp(email.trim(), pw);
+      if (r.exists) { go('signin'); setInfo('You already have an account. Sign in with your password, or use "Forgot password" if you never set one.'); return; }
+      if (r.needsConfirm) { go('confirm'); setWait(60); setInfo('Account created. Enter the code from the confirmation email to finish.'); }
+    });
   };
-  const verify = async () => {
-    if (!/^\d{6,10}$/.test(code.trim())) { setErr('Enter the code from the email (numbers only).'); return; }
-    setBusy(true); setErr('');
-    try { await ctx.api.verifyCode(email.trim(), code.trim()); } catch (e) { setErr(e.message); } finally { setBusy(false); }
-  };
-  if (ctx.api.mode === 'demo') return html`<div class="screen">
-    <${TopBar} title="Sign in" onBack=${() => ctx.go('welcome')} />
-    <div class="note amber"><${Icon} n="science" /><div>This copy is a preview and can't reach the database, so sign-in is simulated. Open the hosted version to sign in with an emailed code.</div></div>
-    <button class="btn" id="demo-continue" onClick=${async () => { await ctx.api.demoSignIn(); }}>Continue with sample data (Bruno)</button>
-    <button class="btn ghost" onClick=${() => ctx.go('ob')}>Create a new pet profile instead</button>
-  </div>`;
+  const confirm = () => { if (!/^\d{6,10}$/.test(code)) { setErr('Enter the code from the email (numbers only).'); return; } run(() => ctx.api.verifySignup(email.trim(), code)); };
+  const forgot = () => { if (!needEmail()) return; run(async () => { await ctx.api.sendReset(email.trim()); go('resetcode'); setWait(60); setInfo(`If ${email.trim()} has a PetMate account, a reset code is on its way.`); }); };
+  const resetCode = () => { if (!/^\d{6,10}$/.test(code)) { setErr('Enter the code from the email (numbers only).'); return; } ctx.startPasswordReset(); run(async () => { try { await ctx.api.verifyReset(email.trim(), code); } catch (e) { ctx.cancelPasswordReset(); throw e; } }); };
+
+  const titles = { signin: 'Sign in', signup: 'Create your account', confirm: 'Confirm your email', forgot: 'Reset your password', resetcode: 'Enter your reset code' };
+  const back = () => ({ signin: () => ctx.go('welcome'), signup: () => ctx.go('welcome'), confirm: () => go('signup'), forgot: () => go('signin'), resetcode: () => go('forgot') })[mode]();
+  const emailField = html`<${Field} id="au-email" label="Email"><${TextInput} id="au-email" type="email" autocomplete="email" inputmode="email" value=${email} onInput=${v => { setEmail(v); setErr(''); }} placeholder="you@example.com" /></${Field}>`;
+  const codeField = (label) => html`<${Field} id="au-code" label=${label}><input id="au-code" class="input num" style="font-size:26px;letter-spacing:.35em;text-align:center;font-weight:800" inputmode="numeric" autocomplete="one-time-code" maxlength="10" value=${code} onInput=${e => { setCode(e.target.value.replace(/\D/g, '')); setErr(''); }} placeholder="••••••" /></${Field}>`;
+  const errBox = err ? html`<div class="note red" role="alert"><${Icon} n="error" /><div>${err}</div></div>` : null;
+  const infoBox = info ? html`<div class="note mint"><${Icon} n="info" /><div>${info}</div></div>` : null;
+  const demoNote = ctx.api.mode === 'demo' ? html`<div class="note amber"><${Icon} n="science" /><div>Preview: this copy can't reach the database, so any email and password signs you in with sample data.</div></div>` : null;
+
   return html`<div class="screen">
-    <${TopBar} title=${stage === 'email' ? 'Sign in with email' : 'Enter your code'} onBack=${() => stage === 'email' ? ctx.go('welcome') : (setStage('email'), setCode(''), setErr(''))} />
-    ${stage === 'email' ? html`
-      <p class="lede">No password needed. We'll email you a sign-in code.</p>
-      <${Field} id="si-email" label="Email" error=${err}><${TextInput} id="si-email" type="email" autocomplete="email" inputmode="email" value=${email} onInput=${v => { setEmail(v); setErr(''); }} placeholder="you@example.com" cls=${err ? 'bad' : ''} /></${Field}>
-      <button class="btn" id="si-send" disabled=${busy} onClick=${send}><${Busy} busy=${busy}><${Icon} n="mail" />Email me a sign-in code</${Busy}></button>
-      <button class="linkbtn" id="si-have" style="align-self:center" onClick=${() => { if (!valid) { setErr('Enter your email first, then your code'); return; } setErr(''); setStage('sent'); }}>I already have a code</button>
-      <div class="note blue"><${Icon} n="verified_user" /><div>New here? The same code creates your account. Caregivers never need one; they get read-only links you can revoke.</div></div>
-    ` : html`
-      <div class="card flat stack" style="align-items:center;text-align:center;gap:8px">
-        <span class="kind k-food" style="width:56px;height:56px;border-radius:18px"><${Icon} n="mark_email_read" style="font-size:30px" /></span>
-        <h3>Code sent to ${email}</h3>
-        <p class="small" style="margin:0">Use the code from the <b>newest</b> PetMate email. Each new email cancels the previous code. It can take a minute; check spam too.</p>
-      </div>
-      <form class="stack" onSubmit=${e => { e.preventDefault(); verify(); }}>
-        <${Field} id="si-code" label="Sign-in code" error=${err}><input id="si-code" class=${`input num ${err ? 'bad' : ''}`} style="font-size:26px;letter-spacing:.35em;text-align:center;font-weight:800" inputmode="numeric" autocomplete="one-time-code" maxlength="10" value=${code} onInput=${e => { setCode(e.target.value.replace(/\D/g, '')); setErr(''); }} placeholder="••••••" /></${Field}>
-        <button class="btn" id="si-verify" type="submit" disabled=${busy || code.length < 6}><${Busy} busy=${busy}>Sign in</${Busy}></button>
-      </form>
-      <button class="btn ghost" disabled=${wait > 0 || busy} onClick=${send}>${wait > 0 ? `Send a new code in ${wait}s` : 'Send a new code'}</button>
-      <p class="small" style="margin:0;text-align:center">The email may also contain a link. It works too, but only in this same browser.</p>
-    `}
+    <${TopBar} title=${titles[mode]} onBack=${back} />
+    ${demoNote}${infoBox}
+    ${mode === 'signin' && html`<form class="stack" style="gap:14px" onSubmit=${e => { e.preventDefault(); signIn(); }}>
+      ${emailField}
+      <${Field} id="au-pw" label="Password"><${PasswordInput} id="au-pw" autocomplete="current-password" value=${pw} onInput=${v => { setPw(v); setErr(''); }} /></${Field}>
+      <button type="button" class="linkbtn" style="align-self:flex-end" onClick=${() => go('forgot')}>Forgot password?</button>
+      ${errBox}
+      <button class="btn" id="au-signin" type="submit" disabled=${busy}><${Busy} busy=${busy}>Sign in</${Busy}></button>
+      <p class="small" style="margin:0;text-align:center">New to PetMate? <button type="button" class="linkbtn" onClick=${() => go('signup')}>Create an account</button></p>
+    </form>`}
+    ${mode === 'signup' && html`<form class="stack" style="gap:14px" onSubmit=${e => { e.preventDefault(); signUp(); }}>
+      ${emailField}
+      <${Field} id="au-newpw" label="Password" hint="At least 8 characters, with letters and numbers"><${PasswordInput} id="au-newpw" autocomplete="new-password" value=${pw} onInput=${v => { setPw(v); setErr(''); }} /></${Field}>
+      <${Field} id="au-newpw2" label="Repeat password"><${PasswordInput} id="au-newpw2" autocomplete="new-password" value=${pw2} onInput=${v => { setPw2(v); setErr(''); }} /></${Field}>
+      ${errBox}
+      <button class="btn" id="au-signup" type="submit" disabled=${busy}><${Busy} busy=${busy}>Create account</${Busy}></button>
+      <p class="small" style="margin:0;text-align:center">Already registered? <button type="button" class="linkbtn" onClick=${() => go('signin')}>Sign in</button></p>
+      <div class="note blue"><${Icon} n="verified_user" /><div>Caregivers never need an account. You share read-only links with them that you can revoke.</div></div>
+    </form>`}
+    ${mode === 'confirm' && html`<form class="stack" style="gap:14px" onSubmit=${e => { e.preventDefault(); confirm(); }}>
+      <p class="lede">We sent a code to <b>${email}</b>. Use the code from the newest PetMate email.</p>
+      ${codeField('Confirmation code')}${errBox}
+      <button class="btn" id="au-confirm" type="submit" disabled=${busy || code.length < 6}><${Busy} busy=${busy}>Confirm email</${Busy}></button>
+      <button type="button" class="btn ghost" disabled=${wait > 0 || busy} onClick=${() => run(async () => { await ctx.api.resendSignup(email.trim()); setWait(60); setInfo('A new code is on its way. Only the newest code works.'); })}>${wait > 0 ? `Send a new code in ${wait}s` : 'Send a new code'}</button>
+    </form>`}
+    ${mode === 'forgot' && html`<form class="stack" style="gap:14px" onSubmit=${e => { e.preventDefault(); forgot(); }}>
+      <p class="lede">We'll email you a code to set a new password.</p>
+      ${emailField}${errBox}
+      <button class="btn" id="au-forgot" type="submit" disabled=${busy}><${Busy} busy=${busy}><${Icon} n="mail" />Email me a reset code</${Busy}></button>
+      <button type="button" class="linkbtn" style="align-self:center" onClick=${() => { if (needEmail()) go('resetcode'); }}>I already have a code</button>
+    </form>`}
+    ${mode === 'resetcode' && html`<form class="stack" style="gap:14px" onSubmit=${e => { e.preventDefault(); resetCode(); }}>
+      <p class="lede">Enter the code sent to <b>${email}</b>. Use the newest PetMate email.</p>
+      ${codeField('Reset code')}${errBox}
+      <button class="btn" id="au-resetcode" type="submit" disabled=${busy || code.length < 6}><${Busy} busy=${busy}>Continue</${Busy}></button>
+      <button type="button" class="btn ghost" disabled=${wait > 0 || busy} onClick=${() => run(async () => { await ctx.api.sendReset(email.trim()); setWait(60); setInfo('A new code is on its way. Only the newest code works.'); })}>${wait > 0 ? `Send a new code in ${wait}s` : 'Send a new code'}</button>
+    </form>`}
+  </div>`;
+}
+
+function NewPassword({ ctx }) {
+  const [pw, setPw] = useState(''); const [pw2, setPw2] = useState('');
+  const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
+  const save = async () => {
+    const p = pwProblem(pw); if (p) { setErr(p); return; }
+    if (pw !== pw2) { setErr("The two passwords don't match"); return; }
+    setBusy(true); setErr('');
+    try { await ctx.api.setPassword(pw); ctx.finishPasswordReset(); ctx.toast('New password saved'); } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  return html`<div class="screen">
+    <${TopBar} title="Set a new password" />
+    <p class="lede">You're signed in. Choose a new password for next time.</p>
+    <form class="stack" style="gap:14px" onSubmit=${e => { e.preventDefault(); save(); }}>
+      <${Field} id="np-pw" label="New password" hint="At least 8 characters, with letters and numbers"><${PasswordInput} id="np-pw" autocomplete="new-password" value=${pw} onInput=${v => { setPw(v); setErr(''); }} /></${Field}>
+      <${Field} id="np-pw2" label="Repeat new password"><${PasswordInput} id="np-pw2" autocomplete="new-password" value=${pw2} onInput=${v => { setPw2(v); setErr(''); }} /></${Field}>
+      ${err && html`<div class="note red" role="alert"><${Icon} n="error" /><div>${err}</div></div>`}
+      <button class="btn" id="np-save" type="submit" disabled=${busy}><${Busy} busy=${busy}>Save new password</${Busy}></button>
+    </form>
   </div>`;
 }
 
@@ -1135,6 +1219,7 @@ function Profile({ ctx }) {
       <div class="small">${ctx.profile?.full_name || 'Owner'} · ${ctx.profile?.email || ctx.session?.user?.email || ''}${ctx.profile?.phone ? ` · ${ctx.profile.phone}` : ''}</div>
       <div class="row wrap" style="gap:8px">
         <button class="btn ghost sm" onClick=${() => ctx.openSheet({ type: 'account' })}><${Icon} n="person" />Edit my details</button>
+        <button class="btn ghost sm" onClick=${() => ctx.openSheet({ type: 'password' })}><${Icon} n="key" />Change password</button>
         <button class="btn ghost sm" onClick=${() => ctx.go('ob')}><${Icon} n="add" />Add another pet</button>
         <button class="btn ghost sm" onClick=${() => ctx.go('datamap')}><${Icon} n="schema" />Where data is saved</button>
         <button class="btn danger sm" onClick=${ctx.signOut}><${Icon} n="logout" />Sign out</button>
@@ -1566,7 +1651,7 @@ function Emergency({ ctx }) {
 
 /* =============================== Data map (form → table) =============================== */
 const DATAMAP = [
-  ['Sign in', [['Email (magic link)', 'auth.users.email → profiles.email', 'trigger on sign-up creates profiles row (PK = auth user id)']]],
+  ['Sign in / create account', [['Email', 'auth.users.email → profiles.email', 'trigger on sign-up creates profiles row (PK = auth user id)'], ['Password', 'auth.users (hashed by Supabase)', 'never stored in PetMate tables']]],
   ['Onboarding 1 · About you', [['Your name', 'profiles.full_name', ''], ['Mobile', 'profiles.phone', 'format check']]],
   ['Onboarding 2 · Pet profile', [['Photo', 'storage pet-photos → pets.photo_path', 'private bucket, per-user folder'], ['Species', 'pets.species', 'enum dog / cat / other'], ["Pet's name", 'pets.name', 'required'], ['Breed', 'pets.breed', ''], ['Birthday', 'pets.birth_date', 'date, not in future'], ['Sex / neutered', 'pets.sex, pets.is_neutered', 'enum + boolean'], ['Weight', 'pets.weight_kg + weight_logs', 'numeric 0–200']]],
   ['Onboarding 3 · Care & health', [['Allergies', 'pet_health.allergies', 'text[] · 1:1 with pets'], ['Conditions', 'pet_health.conditions', 'text[]'], ['Primary vet', 'vets row → pets.primary_vet_id', 'FK → vets.id'], ['Microchip', 'pets.microchip_no', 'unique']]],
@@ -1697,6 +1782,20 @@ function AccountSheet({ ctx }) {
     <${Field} id="ac-phone" label="Mobile" error=${err}><${TextInput} id="ac-phone" type="tel" value=${phone} onInput=${v => { setPhone(v); setErr(''); }} /></${Field}>
     <button class="btn" disabled=${busy} onClick=${save}><${Busy} busy=${busy}>Save</${Busy}></button></div>`;
 }
+function PasswordSheet({ ctx }) {
+  const [pw, setPw] = useState(''); const [pw2, setPw2] = useState('');
+  const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
+  const save = async () => {
+    const p = pwProblem(pw); if (p) { setErr(p); return; }
+    if (pw !== pw2) { setErr("The two passwords don't match"); return; }
+    setBusy(true);
+    try { await ctx.api.setPassword(pw); ctx.closeSheet(); ctx.toast('Password changed'); } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  return html`<div class="stack"><h2>Change password</h2>
+    <${Field} id="cp-pw" label="New password" hint="At least 8 characters, with letters and numbers"><${PasswordInput} id="cp-pw" autocomplete="new-password" value=${pw} onInput=${v => { setPw(v); setErr(''); }} /></${Field}>
+    <${Field} id="cp-pw2" label="Repeat new password" error=${err}><${PasswordInput} id="cp-pw2" autocomplete="new-password" value=${pw2} onInput=${v => { setPw2(v); setErr(''); }} /></${Field}>
+    <button class="btn" disabled=${busy} onClick=${save}><${Busy} busy=${busy}>Save password</${Busy}></button></div>`;
+}
 function ModeSheet({ ctx }) {
   return ctx.api.mode === 'live' ? html`<div class="stack"><h2>Connected to your database</h2><p class="lede">Everything you save goes to Supabase project <span class="mono">PetMateDBProject</span>, protected so each owner only sees their own pets.</p></div>`
     : html`<div class="stack"><h2>Preview with sample data</h2>
@@ -1733,6 +1832,7 @@ function App() {
   const [viewToken, setViewToken] = useState(null);
   const [booting, setBooting] = useState(true);
   const scrollRef = useRef();
+  const resetRef = useRef(false);
   const toastT = useRef();
   const day = todayISO();
   const publicToken = useMemo(() => { try { return new URLSearchParams(location.search).get('share'); } catch { return null; } }, []);
@@ -1761,8 +1861,12 @@ function App() {
         if (s) setScreen(ps.length ? 'home' : 'ob');
       } catch (e) { toast(e.message, 'err'); }
       setBooting(false);
-      a.onAuth(async () => {
-        try { const { s, ps } = await loadFor(a); setScreen(sc => !s ? 'welcome' : !ps.length ? 'ob' : ['welcome', 'signin'].includes(sc) ? 'home' : sc); }
+      a.onAuth(async evt => {
+        try {
+          const { s, ps } = await loadFor(a);
+          if (s && (evt === 'PASSWORD_RECOVERY' || resetRef.current)) { setScreen('newpassword'); return; }
+          setScreen(sc => !s ? 'welcome' : sc === 'newpassword' ? sc : !ps.length ? 'ob' : ['welcome', 'signin', 'signup'].includes(sc) ? 'home' : sc);
+        }
         catch (e) { toast(e.message, 'err'); }
       });
     })();
@@ -1770,7 +1874,7 @@ function App() {
   useEffect(() => { scrollRef.current && (scrollRef.current.scrollTop = 0); }, [screen]);
 
   const pet = pets.find(p => p.id === petId) || null;
-  const go = s => { setSheet(null); if (s === 'ob' && api?.mode === 'live' && !session) { setScreen('signin'); return; } setScreen(s); };
+  const go = s => { setSheet(null); if (s === 'ob' && api?.mode === 'live' && !session) { setScreen('signup'); return; } setScreen(s); };
   const ctx = {
     api, session, profile, pets, pet, bundle, day, screen, go, toast,
     openSheet: setSheet, closeSheet: () => setSheet(null),
@@ -1788,6 +1892,9 @@ function App() {
     revokeShare: async id => { try { await api.revokeShare(id); await loadFor(api, petId); toast('Link revoked. It stops working now.'); } catch (e) { toast(e.message, 'err'); } },
     signOut: async () => { await api.signOut(); setSheet(null); setScreen('welcome'); await loadFor(api); },
     showShare: token => { setViewToken(token); setScreen('shareview'); },
+    startPasswordReset: () => { resetRef.current = true; },
+    cancelPasswordReset: () => { resetRef.current = false; },
+    finishPasswordReset: async () => { resetRef.current = false; const { ps } = await loadFor(api, petId); setScreen(ps.length ? 'home' : 'ob'); },
   };
 
   if (!api || booting) return html`<div class="shell"><div class="phone"><div class="center"><img class="logo-stacked" src=${LOGO.stacked} alt="PetMate" width="170" height="149" /><span class="spinner"></span></div></div></div>`;
@@ -1796,19 +1903,19 @@ function App() {
   const ready = pet && bundle;
   const S = NEEDS_PET.has(screen) && !ready ? (session ? 'ob' : 'welcome') : screen;
   const body = {
-    welcome: () => html`<${Welcome} ctx=${ctx} />`, signin: () => html`<${SignIn} ctx=${ctx} />`, ob: () => html`<${Onboarding} ctx=${ctx} />`,
+    welcome: () => html`<${Welcome} ctx=${ctx} />`, signin: () => html`<${Auth} key="signin" ctx=${ctx} start="signin" />`, signup: () => html`<${Auth} key="signup" ctx=${ctx} start="signup" />`, newpassword: () => html`<${NewPassword} ctx=${ctx} />`, ob: () => html`<${Onboarding} ctx=${ctx} />`,
     home: () => html`<${Home} ctx=${ctx} />`, profile: () => html`<${Profile} ctx=${ctx} />`, routine: () => html`<${Routine} key=${pet.id} ctx=${ctx} />`,
     handoff: () => html`<${Handoff} ctx=${ctx} />`, meds: () => html`<${Meds} ctx=${ctx} />`, ask: () => html`<${Ask} ctx=${ctx} />`,
     scan: () => html`<${Scan} key=${pet.id} ctx=${ctx} />`, emergency: () => html`<${Emergency} ctx=${ctx} />`, datamap: () => html`<${DataMap} ctx=${ctx} />`,
     shareview: () => html`<${ShareView} ctx=${ctx} token=${viewToken} />`,
   }[S]();
   const tabs = [['home', 'Home', 'home'], ['routine', 'Routine', 'checklist'], ['ask', 'Ask', 'auto_awesome'], ['meds', 'Meds', 'medication'], ['profile', pet?.name || 'Pet', 'pets']];
-  const showTabs = ready && !['welcome', 'signin', 'ob', 'datamap', 'shareview'].includes(S);
+  const showTabs = ready && !['welcome', 'signin', 'signup', 'newpassword', 'ob', 'datamap', 'shareview'].includes(S);
   const groups = [...new Set(SCREENS.map(s => s[3]))];
   const sheetBody = sheet && {
     link: () => html`<${LinkSheet} ctx=${ctx} ...${sheet} />`, routineSaved: () => html`<${RoutineSavedSheet} ctx=${ctx} />`,
     med: () => html`<${MedSheet} ctx=${ctx} docId=${sheet.docId} initialText=${sheet.text} />`, vaccine: () => html`<${VaccineSheet} ctx=${ctx} />`,
-    weight: () => html`<${WeightSheet} ctx=${ctx} />`, editPet: () => html`<${EditPetSheet} ctx=${ctx} />`, account: () => html`<${AccountSheet} ctx=${ctx} />`, mode: () => html`<${ModeSheet} ctx=${ctx} />`,
+    weight: () => html`<${WeightSheet} ctx=${ctx} />`, editPet: () => html`<${EditPetSheet} ctx=${ctx} />`, account: () => html`<${AccountSheet} ctx=${ctx} />`, password: () => html`<${PasswordSheet} ctx=${ctx} />`, mode: () => html`<${ModeSheet} ctx=${ctx} />`,
   }[sheet.type]?.();
 
   return html`<div class="shell">
