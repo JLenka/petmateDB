@@ -761,7 +761,7 @@ function friendly(e) {
   if (wait) return new Error(`Please wait ${wait[1]} seconds before requesting another sign-in email.`);
   if (/email rate limit|over_email_send_rate_limit/i.test(m) || e?.code === 'over_email_send_rate_limit') return new Error('The hourly limit for sign-in emails has been reached. Try again in up to an hour, or use the code from an email you already received.');
   if (/rate limit|too many/i.test(m)) return new Error('Too many attempts just now. Wait a few minutes and try again.');
-  if (/Token has expired|invalid/i.test(m) && /otp|token/i.test(m)) return new Error('That code has expired or is wrong. Request a new link.');
+  if (/otp_expired|token has expired|invalid/i.test(m) && /otp|token|code/i.test(m + (e?.code || ''))) return new Error('That code is wrong, expired, or was replaced by a newer email. Use the code from the most recent PetMate email.');
   if (/microchip/i.test(m) || /pets_microchip_unique/.test(m)) return new Error('That microchip number is already registered to another pet.');
   if (/violates check constraint/i.test(m)) return new Error('One of the values is out of range. Check dates, weight and phone number.');
   if (/JWT|not signed in|28000/i.test(m)) return new Error('Your session ended. Sign in again.');
@@ -916,26 +916,30 @@ function SignIn({ ctx }) {
   };
   if (ctx.api.mode === 'demo') return html`<div class="screen">
     <${TopBar} title="Sign in" onBack=${() => ctx.go('welcome')} />
-    <div class="note amber"><${Icon} n="science" /><div>This copy is a preview and can't reach the database, so sign-in is simulated. Open the hosted version to use real magic-link sign-in.</div></div>
+    <div class="note amber"><${Icon} n="science" /><div>This copy is a preview and can't reach the database, so sign-in is simulated. Open the hosted version to sign in with an emailed code.</div></div>
     <button class="btn" id="demo-continue" onClick=${async () => { await ctx.api.demoSignIn(); }}>Continue with sample data (Bruno)</button>
     <button class="btn ghost" onClick=${() => ctx.go('ob')}>Create a new pet profile instead</button>
   </div>`;
   return html`<div class="screen">
-    <${TopBar} title=${stage === 'email' ? 'Sign in with email' : 'Check your inbox'} onBack=${() => stage === 'email' ? ctx.go('welcome') : setStage('email')} />
+    <${TopBar} title=${stage === 'email' ? 'Sign in with email' : 'Enter your code'} onBack=${() => stage === 'email' ? ctx.go('welcome') : (setStage('email'), setCode(''), setErr(''))} />
     ${stage === 'email' ? html`
-      <p class="lede">No password needed. We'll email you a secure sign-in link.</p>
+      <p class="lede">No password needed. We'll email you a sign-in code.</p>
       <${Field} id="si-email" label="Email" error=${err}><${TextInput} id="si-email" type="email" autocomplete="email" inputmode="email" value=${email} onInput=${v => { setEmail(v); setErr(''); }} placeholder="you@example.com" cls=${err ? 'bad' : ''} /></${Field}>
-      <button class="btn" id="si-send" disabled=${busy} onClick=${send}><${Busy} busy=${busy}><${Icon} n="mail" />Email me a sign-in link</${Busy}></button>
-      <div class="note blue"><${Icon} n="verified_user" /><div>New here? The same link creates your account. Caregivers never need one; they get read-only links you can revoke.</div></div>
+      <button class="btn" id="si-send" disabled=${busy} onClick=${send}><${Busy} busy=${busy}><${Icon} n="mail" />Email me a sign-in code</${Busy}></button>
+      <button class="linkbtn" id="si-have" style="align-self:center" onClick=${() => { if (!valid) { setErr('Enter your email first, then your code'); return; } setErr(''); setStage('sent'); }}>I already have a code</button>
+      <div class="note blue"><${Icon} n="verified_user" /><div>New here? The same code creates your account. Caregivers never need one; they get read-only links you can revoke.</div></div>
     ` : html`
       <div class="card flat stack" style="align-items:center;text-align:center;gap:8px">
         <span class="kind k-food" style="width:56px;height:56px;border-radius:18px"><${Icon} n="mark_email_read" style="font-size:30px" /></span>
-        <h3>Link sent to ${email}</h3>
-        <p class="small" style="margin:0">Open it on this device to sign in. It can take a minute; check spam too.</p>
+        <h3>Code sent to ${email}</h3>
+        <p class="small" style="margin:0">Use the code from the <b>newest</b> PetMate email. Each new email cancels the previous code. It can take a minute; check spam too.</p>
       </div>
-      <${Field} id="si-code" label="Or enter the code from the email" error=${err} hint="Only if your email shows a code"><${TextInput} id="si-code" inputmode="numeric" autocomplete="one-time-code" value=${code} onInput=${v => { setCode(v.replace(/\D/g, '')); setErr(''); }} placeholder="123456" /></${Field}>
-      <button class="btn" id="si-verify" disabled=${busy || !code} onClick=${verify}><${Busy} busy=${busy}>Verify code</${Busy}></button>
-      <button class="btn ghost" disabled=${wait > 0 || busy} onClick=${send}>${wait > 0 ? `Resend in ${wait}s` : 'Resend link'}</button>
+      <form class="stack" onSubmit=${e => { e.preventDefault(); verify(); }}>
+        <${Field} id="si-code" label="Sign-in code" error=${err}><input id="si-code" class=${`input num ${err ? 'bad' : ''}`} style="font-size:26px;letter-spacing:.35em;text-align:center;font-weight:800" inputmode="numeric" autocomplete="one-time-code" maxlength="10" value=${code} onInput=${e => { setCode(e.target.value.replace(/\D/g, '')); setErr(''); }} placeholder="••••••" /></${Field}>
+        <button class="btn" id="si-verify" type="submit" disabled=${busy || code.length < 6}><${Busy} busy=${busy}>Sign in</${Busy}></button>
+      </form>
+      <button class="btn ghost" disabled=${wait > 0 || busy} onClick=${send}>${wait > 0 ? `Send a new code in ${wait}s` : 'Send a new code'}</button>
+      <p class="small" style="margin:0;text-align:center">The email may also contain a link. It works too, but only in this same browser.</p>
     `}
   </div>`;
 }
